@@ -40,7 +40,7 @@ MAX_OUTPUT_CHARS = 20_000
 DEFAULT_TIMEOUT = 15   # seconds
 MAX_TIMEOUT = 30        # hard ceiling — keep runs short on shared free-tier CPU
 CPU_TIME_LIMIT_S = 20
-MAX_PROCESSES = 64
+MAX_PROCESSES = 1024
 MAX_OUTPUT_FILE_BYTES = 10 * 1024 * 1024
 
 # RLIMIT_AS caps *reserved* virtual address space, not actual usage — and
