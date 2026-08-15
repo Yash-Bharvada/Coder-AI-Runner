@@ -15,13 +15,68 @@ RUNNER_URL = os.environ.get("CODE_RUNNER_URL", "https://<your-service-name>.onre
 REQUEST_TIMEOUT_BUFFER = 10  # give the HTTP call a bit longer than the run itself
 
 
-def run_remote(language: str, code: str, stdin: str = "", timeout: int = 15) -> dict:
-    """Calls the hosted runner Space. Returns the same shape as RunResult
-    in code_runner.py (success, stdout, stderr, exit_code, timed_out)."""
+def run_remote(
+    language: str,
+    code: str | None = None,
+    stdin: str = "",
+    timeout: int = 15,
+    *,
+    files: dict[str, str] | None = None,
+    entry_point: str | None = None,
+) -> dict:
+    """Calls the hosted runner. Returns the same shape as RunResult in
+    code_runner.py (success, stdout, stderr, exit_code, timed_out).
+
+    Single-file mode (existing behaviour — unchanged):
+        run_remote("python", code="print('hello')")
+
+    Multi-file mode (new):
+        run_remote(
+            "python",
+            files={
+                "main.py": "from helper import greet\\nprint(greet())",
+                "helper.py": "def greet():\\n    return 'hello from helper'",
+            },
+            entry_point="main.py",
+        )
+
+    Exactly one of `code` or `files` must be provided — the runner returns
+    HTTP 400 if both or neither are set.  This function enforces the same
+    constraint locally so callers get a clear error before hitting the network.
+
+    NOTE on multi-file Python: only stdlib imports are supported for now.
+    If requirements.txt is included in `files`, the runner will still execute
+    the project but will surface a notice in stderr explaining that third-party
+    packages are not installed.  See Option A comment in main.py for rationale.
+    """
+    has_code = code is not None
+    has_files = files is not None
+
+    if has_code and has_files:
+        raise ValueError("Provide either 'code' (single-file) or 'files' (multi-file), not both.")
+    if not has_code and not has_files:
+        raise ValueError("One of 'code' (single-file) or 'files' (multi-file) is required.")
+
+    # Build the payload — omit the key entirely rather than sending null/""
+    # so the runner's Pydantic model sees None (not an empty string) and the
+    # mutual-exclusion validation works correctly.
+    if has_code:
+        payload: dict = {"language": language, "code": code, "stdin": stdin, "timeout": timeout}
+    else:
+        if not entry_point:
+            raise ValueError("'entry_point' is required when 'files' is set.")
+        payload = {
+            "language": language,
+            "files": files,
+            "entry_point": entry_point,
+            "stdin": stdin,
+            "timeout": timeout,
+        }
+
     try:
         resp = requests.post(
             f"{RUNNER_URL}/run",
-            json={"language": language, "code": code, "stdin": stdin, "timeout": timeout},
+            json=payload,
             timeout=timeout + REQUEST_TIMEOUT_BUFFER,
         )
         resp.raise_for_status()
@@ -50,5 +105,18 @@ def wake_runner() -> bool:
 
 if __name__ == "__main__":
     print("Waking runner…", wake_runner())
-    result = run_remote("python", "print('hello from the Space')")
-    print(result)
+
+    # ── Single-file example (existing behaviour) ──────────────────────────
+    result = run_remote("python", code="print('hello from single-file mode')")
+    print("single-file:", result)
+
+    # ── Multi-file example (new) ───────────────────────────────────────────
+    result = run_remote(
+        "python",
+        files={
+            "main.py": "from helper import greet\nprint(greet())",
+            "helper.py": "def greet():\n    return 'hello from helper module'",
+        },
+        entry_point="main.py",
+    )
+    print("multi-file:", result)

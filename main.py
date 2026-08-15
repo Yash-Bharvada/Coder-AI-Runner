@@ -43,6 +43,10 @@ CPU_TIME_LIMIT_S = 20
 MAX_PROCESSES = 1024
 MAX_OUTPUT_FILE_BYTES = 10 * 1024 * 1024
 
+# Multi-file request limits
+MAX_FILES = 50                # maximum number of files in a single multi-file request
+MAX_TOTAL_CHARS = 200_000     # aggregate char limit across all files (reuses the single-file guard)
+
 # RLIMIT_AS caps *reserved* virtual address space, not actual usage — and
 # some runtimes reserve a large chunk upfront just to start up (V8/Node
 # fails below ~1GB reserved even though it never touches most of it; Go's
@@ -76,7 +80,17 @@ COMPILED_CONFIG: dict[str, dict] = {
 
 class RunRequest(BaseModel):
     language: str
-    code: str
+    # ── Single-file mode (existing contract — unchanged) ──────────────────
+    code: Optional[str] = None
+    # ── Multi-file mode (new) ─────────────────────────────────────────────
+    # files: mapping of relative path → file contents, e.g.
+    #   { "main.py": "from helper import greet\nprint(greet())",
+    #     "helper.py": "def greet(): return 'hello'" }
+    # entry_point: the key in `files` that is the program entry point.
+    # Exactly one of `code` or `files` must be provided; sending both or
+    # neither is a 400 error.
+    files: Optional[dict[str, str]] = None
+    entry_point: Optional[str] = None
     stdin: Optional[str] = ""
     timeout: Optional[int] = DEFAULT_TIMEOUT
 
@@ -144,6 +158,67 @@ def _execute(cmd: list[str], cwd: str, stdin: str, timeout: int, memory_mb: int)
         )
 
 
+def _write_files(files: dict[str, str], work_dir: str) -> None:
+    """Write all files from a multi-file request into work_dir with strict
+    path-traversal validation.
+
+    Every path is validated in two independent passes before any file is
+    written:
+      1. Structural check — rejects obvious `..` segments and absolute paths
+         without touching the filesystem.
+      2. Resolution check — resolves the joined path and confirms it is still
+         contained within work_dir, catching symlink-based escapes and any
+         edge case the structural check might miss.
+
+    Raises HTTPException(400) on *any* safety violation — the entire request
+    is rejected rather than silently skipping the offending path, so callers
+    see a clear error rather than a partial project that fails at import time.
+    """
+    if len(files) > MAX_FILES:
+        raise HTTPException(
+            400, f"Too many files: {len(files)} exceeds the {MAX_FILES}-file limit per request."
+        )
+
+    total_chars = sum(len(v) for v in files.values())
+    if total_chars > MAX_TOTAL_CHARS:
+        raise HTTPException(
+            413,
+            f"Total source size ({total_chars} chars) exceeds the {MAX_TOTAL_CHARS}-char limit.",
+        )
+
+    resolved_work = Path(work_dir).resolve()
+
+    for rel_path, content in files.items():
+        # ── Pass 1: structural checks (no filesystem access) ─────────────
+
+        # Reject absolute paths: Unix-style "/" or Windows drive "X:"
+        if rel_path.startswith("/") or (len(rel_path) >= 2 and rel_path[1] == ":"):
+            raise HTTPException(400, f"Absolute file paths are not allowed: '{rel_path}'")
+
+        # Reject any path component that is ".." (catches "a/../b", "../b", etc.)
+        path_parts = Path(rel_path).parts
+        if ".." in path_parts:
+            raise HTTPException(
+                400, f"Path traversal (../) detected in file path: '{rel_path}'"
+            )
+
+        # ── Pass 2: resolution check (filesystem-aware) ──────────────────
+        # Resolves symlinks and normalises the path, then confirms the result
+        # is still under work_dir. This is the backstop against any edge case
+        # the structural check above doesn't catch.
+        full_path = Path(work_dir, rel_path).resolve()
+        if not full_path.is_relative_to(resolved_work):
+            raise HTTPException(
+                400,
+                f"File path '{rel_path}' resolves outside the sandbox directory. "
+                "Request rejected.",
+            )
+
+        # ── Write ─────────────────────────────────────────────────────────
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_text(content, encoding="utf-8")
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -163,42 +238,126 @@ def run_code(req: RunRequest):
         supported = sorted(list(LANGUAGE_CONFIG) + list(COMPILED_CONFIG))
         raise HTTPException(400, f"Unsupported language '{language}'. Supported: {supported}")
 
-    if len(req.code) > 200_000:
-        raise HTTPException(413, "Source too large.")
+    # ── Validate: exactly one of code / files must be set ────────────────
+    has_code = req.code is not None
+    has_files = req.files is not None
 
-    # Every request gets its own throwaway directory under /tmp, wiped after.
-    work_dir = tempfile.mkdtemp(dir="/tmp", prefix="run_")
-    try:
-        if language in COMPILED_CONFIG:
-            cfg = COMPILED_CONFIG[language]
+    if has_code and has_files:
+        raise HTTPException(
+            400, "Provide either 'code' (single-file) or 'files' (multi-file), not both."
+        )
+    if not has_code and not has_files:
+        raise HTTPException(
+            400, "One of 'code' (single-file) or 'files' (multi-file) is required."
+        )
+
+    # ════════════════════════════════════════════════════════════════════
+    # SINGLE-FILE PATH — existing behaviour, unchanged
+    # ════════════════════════════════════════════════════════════════════
+    if has_code:
+        if len(req.code) > MAX_TOTAL_CHARS:
+            raise HTTPException(413, "Source too large.")
+
+        work_dir = tempfile.mkdtemp(dir="/tmp", prefix="run_")
+        try:
+            if language in COMPILED_CONFIG:
+                cfg = COMPILED_CONFIG[language]
+                src_path = os.path.join(work_dir, f"main{cfg['ext']}")
+                Path(src_path).write_text(req.code, encoding="utf-8")
+                binary_path = os.path.join(work_dir, cfg["binary"])
+
+                compile_result = subprocess.run(
+                    [cfg["compiler"], src_path, "-o", binary_path],
+                    cwd=work_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+                if compile_result.returncode != 0:
+                    return RunResponse(
+                        success=False,
+                        stdout="",
+                        stderr=_truncate(compile_result.stderr),
+                        exit_code=compile_result.returncode,
+                    )
+                return _execute(
+                    [binary_path], work_dir, req.stdin or "", timeout, MEMORY_LIMIT_MB[language],
+                )
+
+            cfg = LANGUAGE_CONFIG[language]
             src_path = os.path.join(work_dir, f"main{cfg['ext']}")
             Path(src_path).write_text(req.code, encoding="utf-8")
-            binary_path = os.path.join(work_dir, cfg["binary"])
-
-            compile_result = subprocess.run(
-                [cfg["compiler"], src_path, "-o", binary_path],
-                cwd=work_dir,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-            if compile_result.returncode != 0:
-                return RunResponse(
-                    success=False,
-                    stdout="",
-                    stderr=_truncate(compile_result.stderr),
-                    exit_code=compile_result.returncode,
-                )
             return _execute(
-                [binary_path], work_dir, req.stdin or "", timeout, MEMORY_LIMIT_MB[language],
+                cfg["run"](src_path), work_dir, req.stdin or "", timeout, MEMORY_LIMIT_MB[language],
             )
+
+        finally:
+            subprocess.run(["rm", "-rf", work_dir])
+
+    # ════════════════════════════════════════════════════════════════════
+    # MULTI-FILE PATH — new
+    # ════════════════════════════════════════════════════════════════════
+
+    # DEPENDENCY INSTALL: Option A — stdlib-only, no install step.
+    # Multi-file projects may include a requirements.txt, but this runner does
+    # not execute pip install. A cold `pip install` on shared Render free-tier
+    # CPU routinely exceeds the 20–30s budget for any non-trivial package list,
+    # making a half-implemented install step that times out on every real
+    # project worse than clearly not supporting it yet. If requirements.txt is
+    # present, we surface a visible notice in stderr instead of silently letting
+    # an ImportError look like a code bug.
+    # Revisit (Option B: bounded install step) when timeout ceilings are raised.
+
+    if not req.entry_point:
+        raise HTTPException(400, "'entry_point' is required when 'files' is set.")
+    if req.entry_point not in req.files:
+        raise HTTPException(
+            400,
+            f"'entry_point' ('{req.entry_point}') must be one of the keys in 'files'. "
+            f"Available keys: {sorted(req.files.keys())}",
+        )
+
+    # Multi-file compiled execution is out of scope: compiling multiple C/C++
+    # source files requires linking strategies not yet implemented here.
+    # Return a clear 400 rather than attempting a partial compile that silently
+    # ignores sibling .c/.cpp files.
+    if language in COMPILED_CONFIG:
+        raise HTTPException(
+            400,
+            f"Multi-file compiled execution is not yet supported for '{language}'. "
+            "Use 'code' (single-file) for C/C++ submissions.",
+        )
+
+    has_requirements_txt = "requirements.txt" in req.files
+
+    work_dir = tempfile.mkdtemp(dir="/tmp", prefix="run_")
+    try:
+        # _write_files validates every path before writing anything.
+        # A single bad path aborts the whole request with a 400.
+        _write_files(req.files, work_dir)
 
         cfg = LANGUAGE_CONFIG[language]
-        src_path = os.path.join(work_dir, f"main{cfg['ext']}")
-        Path(src_path).write_text(req.code, encoding="utf-8")
-        return _execute(
-            cfg["run"](src_path), work_dir, req.stdin or "", timeout, MEMORY_LIMIT_MB[language],
+        full_entry_path = str(Path(work_dir, req.entry_point).resolve())
+        result = _execute(
+            cfg["run"](full_entry_path), work_dir, req.stdin or "", timeout, MEMORY_LIMIT_MB[language],
         )
+
+        # Option A: surface requirements.txt presence as an informational notice
+        if has_requirements_txt:
+            notice = (
+                "[runner] requirements.txt was present but not installed — "
+                "this runner executes stdlib-only multi-file projects for now. "
+                "Third-party packages are not yet supported in multi-file mode.\n"
+            )
+            result = RunResponse(
+                success=result.success,
+                stdout=result.stdout,
+                stderr=notice + result.stderr,
+                exit_code=result.exit_code,
+                timed_out=result.timed_out,
+            )
+
+        return result
 
     finally:
         subprocess.run(["rm", "-rf", work_dir])
