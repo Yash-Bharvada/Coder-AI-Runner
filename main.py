@@ -57,7 +57,7 @@ MAX_TOTAL_CHARS = 200_000     # aggregate char limit across all files (reuses th
 # RLIMIT_AS alone doesn't meaningfully constrain what V8 can allocate.
 MEMORY_LIMIT_MB: dict[str, int] = {
     "python": 512, "bash": 512, "php": 512, "c": 512, "cpp": 512,
-    "javascript": 1024, "typescript": 1024, "go": 1536,
+    "javascript": 1024, "typescript": 1024, "go": 1536, "java": 2048,
 }
 NODE_HEAP_LIMIT_MB = 512
 
@@ -69,6 +69,10 @@ LANGUAGE_CONFIG: dict[str, dict] = {
     "go":         {"ext": ".go",  "run": lambda f: ["go", "run", f]},
     "php":        {"ext": ".php", "run": lambda f: ["php", f]},
     "bash":       {"ext": ".sh",  "run": lambda f: ["bash", f]},
+    "java":       {"ext": ".java", "run": lambda f: [
+        "java", "-Xms16m", "-Xmx128m", "-XX:CompressedClassSpaceSize=64m",
+        "-XX:ReservedCodeCacheSize=64m", "-XX:ActiveProcessorCount=2", f,
+    ]},
 }
 
 # ── Compiled languages: compile step, then run the resulting binary ──────
@@ -321,11 +325,11 @@ def run_code(req: RunRequest):
     # source files requires linking strategies not yet implemented here.
     # Return a clear 400 rather than attempting a partial compile that silently
     # ignores sibling .c/.cpp files.
-    if language in COMPILED_CONFIG:
+    if language in COMPILED_CONFIG or language == "java":
         raise HTTPException(
             400,
             f"Multi-file compiled execution is not yet supported for '{language}'. "
-            "Use 'code' (single-file) for C/C++ submissions.",
+            "Use 'code' (single-file) for C/C++/Java submissions.",
         )
 
     has_requirements_txt = "requirements.txt" in req.files
