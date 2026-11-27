@@ -41,6 +41,7 @@ DEFAULT_TIMEOUT = 15   # seconds
 MAX_TIMEOUT = 30        # hard ceiling — keep runs short on shared free-tier CPU
 CPU_TIME_LIMIT_S = 20
 MAX_PROCESSES = 1024
+JAVA_MAX_PROCESSES = 4096  # RLIMIT_NPROC counts other same-UID processes on shared hosts.
 MAX_OUTPUT_FILE_BYTES = 10 * 1024 * 1024
 
 # Multi-file request limits
@@ -107,7 +108,7 @@ class RunResponse(BaseModel):
     timed_out: bool = False
 
 
-def _make_limiter(memory_mb: int):
+def _make_limiter(memory_mb: int, process_limit: int = MAX_PROCESSES):
     """Returns a preexec_fn (runs in the child, right before exec) that caps
     CPU time, virtual address space, process count, and max file size — so
     one submission can't stall or starve the whole Space."""
@@ -116,7 +117,7 @@ def _make_limiter(memory_mb: int):
         resource.setrlimit(
             resource.RLIMIT_AS, (memory_mb * 1024 * 1024, memory_mb * 1024 * 1024),
         )
-        resource.setrlimit(resource.RLIMIT_NPROC, (MAX_PROCESSES, MAX_PROCESSES))
+        resource.setrlimit(resource.RLIMIT_NPROC, (process_limit, process_limit))
         resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_OUTPUT_FILE_BYTES, MAX_OUTPUT_FILE_BYTES))
     return _limit_resources
 
@@ -127,7 +128,8 @@ def _truncate(text: str) -> str:
     return text
 
 
-def _execute(cmd: list[str], cwd: str, stdin: str, timeout: int, memory_mb: int) -> RunResponse:
+def _execute(cmd: list[str], cwd: str, stdin: str, timeout: int, memory_mb: int,
+             process_limit: int = MAX_PROCESSES) -> RunResponse:
     try:
         result = subprocess.run(
             cmd,
@@ -136,7 +138,7 @@ def _execute(cmd: list[str], cwd: str, stdin: str, timeout: int, memory_mb: int)
             capture_output=True,
             text=True,
             timeout=timeout,
-            preexec_fn=_make_limiter(memory_mb),
+            preexec_fn=_make_limiter(memory_mb, process_limit),
         )
         return RunResponse(
             success=result.returncode == 0,
@@ -293,6 +295,7 @@ def run_code(req: RunRequest):
             Path(src_path).write_text(req.code, encoding="utf-8")
             return _execute(
                 cfg["run"](src_path), work_dir, req.stdin or "", timeout, MEMORY_LIMIT_MB[language],
+                JAVA_MAX_PROCESSES if language == "java" else MAX_PROCESSES,
             )
 
         finally:
