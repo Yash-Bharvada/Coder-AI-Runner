@@ -9,6 +9,7 @@ FROM python:3.11-slim
 # ---- System + language runtimes (installed as root, before switching user) --
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
+        default-jdk-headless \
         golang \
         php-cli \
         curl \

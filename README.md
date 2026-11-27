@@ -1,7 +1,7 @@
 # Quick Coder — Code Runner
 
 Hosted code-execution backend for Quick Coder. Runs Python, JavaScript,
-TypeScript, Go, PHP, C, C++, and Bash — no Docker required on the client.
+TypeScript, Go, PHP, C, C++, Java 17+, and Bash — no Docker required on the client.
 
 Deploys to **Render** (free tier, Docker-native, no credit card required) —
 Hugging Face Spaces pulled free Docker/CPU hosting in July 2026, so this
@@ -48,7 +48,7 @@ or neither returns HTTP 400).
 - Combined source size capped at **200 000 chars** (same limit as single-file mode).
 - File paths must be relative (no leading `/` or drive letters); `..` segments are rejected with HTTP 400.
 - **Python only (stdlib):** if `requirements.txt` is included in `files` it is ignored — no `pip install` step is performed. A notice appears in `stderr` rather than a silent `ImportError`. See [Known limits](#known-limits-free-tier) for context.
-- **C/C++ multi-file** is not yet supported — use single-file `code` mode for those languages.
+- **C/C++/Java multi-file** is not yet supported — use single-file `code` mode for those languages. Java uses the JDK's source-file launcher, so a public class may have any valid name.
 
 ### Response (both modes)
 
